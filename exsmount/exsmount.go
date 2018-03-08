@@ -24,6 +24,10 @@ import (
 	"github.com/pkg/errors"
 )
 
+func init() {
+	rand.Seed(time.Now().Unix())
+}
+
 // IID holds the attributes from the instance identity document
 type IID struct {
 	AvailabilityZone string `json:"availabilityZone"`
@@ -31,10 +35,6 @@ type IID struct {
 	InstanceType     string `json:"instanceType"`
 	ImageId          string `json:"imageId"`
 	Region           string `json:"region"`
-}
-
-func init() {
-	rand.Seed(time.Now().Unix())
 }
 
 func (i *IID) Get() error {
@@ -427,23 +427,17 @@ func DeleteOnTermination(svc *ec2.EC2, instanceId string, volumeId string, attac
 }
 
 func makeAndMount(attachDevice, mountPoint string) error {
-	var err error
-
-	if err = makeDir(mountPoint); err != nil {
+	if err := makeDir(mountPoint); err != nil {
 		return err
 	}
 
 	opts := []string{"mount", "-o", "noatime", attachDevice, mountPoint}
 	cmd := exec.Command("mount", opts[1:]...)
 	cmd.Stderr, cmd.Stdout = os.Stderr, os.Stderr
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-	return nil
+	return cmd.Run()
 }
 
 func makeDir(path string) error {
-	// mkdir
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			if err := os.MkdirAll(path, os.FileMode(0777)); err != nil {
