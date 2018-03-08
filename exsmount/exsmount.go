@@ -14,12 +14,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/base2genomics/batchit"
-
 	arg "github.com/alexflint/go-arg"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/base2genomics/batchit"
 	"github.com/pkg/errors"
 )
 
@@ -153,7 +152,7 @@ func MountLocal(deviceCandidates []string, mountBase string) ([]string, error) {
 				return nil, err
 			}
 			base := mountBase
-			log.Printf("mounting: %s to %s", dev, base)
+			log.Printf("mounting %s to %s", dev, base)
 			if i > 0 {
 				base = fmt.Sprintf("%s_%d", mountBase, i)
 			}
@@ -277,24 +276,27 @@ func EFSMount(efs string, mountPoint string, mountOpts string) error {
 	return cmd.Run()
 }
 
-// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
-const letters = "abcdefghijklmnopqrstuvwxyz"
+func CreateAttach(cli *Args) ([]string, []string, error) {
+	var devices []string
+	var volumes []string
 
-func CreateAttach(cli *Args) ([]string, error) {
 	iid := &IID{}
 	if err := iid.Get(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
 	sess, err := session.NewSession()
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating session")
+		return nil, nil, errors.Wrap(err, "error creating session")
 	}
+	svc := ec2.New(sess, &aws.Config{Region: aws.String(iid.Region), MaxRetries: aws.Int(3)})
+
 	if cli.VolumeType == "io1" {
 		if cli.Iops == 0 {
 			cli.Iops = 45 * cli.Size
 		}
 		if cli.Iops < 100 || cli.Iops > 20000 {
-			return nil, fmt.Errorf("ebsmount: Iops must be between 100 and 20000")
+			return nil, nil, fmt.Errorf("ebsmount: Iops must be between 100 and 20000")
 		}
 		if cli.Iops > 50*cli.Size {
 			log.Printf("ebsmount: setting IOPs must be <= 50 times size")
@@ -305,28 +307,16 @@ func CreateAttach(cli *Args) ([]string, error) {
 		}
 	}
 
-	var devices []string
-	var volumes []string
-	svc := ec2.New(sess, &aws.Config{Region: aws.String(iid.Region)})
-
 	cli.Size = int64(float64(cli.Size)/float64(cli.N) + 0.5)
+
 	for i := 0; i < cli.N; i++ {
 		log.Println("batchit: creating EBS volume:", i)
 
 		var rsp *ec2.Volume
 		if rsp, err = Create(svc, iid, cli.Size, cli.VolumeType, cli.Iops, i); err != nil {
-			if strings.Contains(err.Error(), "RequestLimitExceeded") {
-				time.Sleep(time.Duration(10+rand.Intn(90)) * time.Second)
-				var err2 error
-				if rsp, err2 = Create(svc, iid, cli.Size, cli.VolumeType, cli.Iops, i); err2 != nil {
-					log.Println("WARNING: this usually means you need to space out job submissions")
-					return nil, errors.Wrap(err, "error creating volume")
-				}
-
-			} else {
-				return nil, errors.Wrap(err, "error creating volume")
-			}
+			return nil, nil, errors.Wrap(err, "error creating volume")
 		}
+
 		attached := false
 
 		defer func() {
@@ -334,11 +324,10 @@ func CreateAttach(cli *Args) ([]string, error) {
 				log.Println("batchit: unsuccessful EBS volume attachment, deleting volume")
 				_, err := svc.DeleteVolume(&ec2.DeleteVolumeInput{VolumeId: rsp.VolumeId})
 				if err != nil {
-					log.Println(err)
+					log.Println("batchit: error deleting volume:", err)
 				}
 			}
 		}()
-		time.Sleep(3 * time.Second) // sleep to avoid doing too many requests.
 
 		// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
 		// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/volume_limits.html
@@ -348,15 +337,16 @@ func CreateAttach(cli *Args) ([]string, error) {
 				break
 			}
 
-			var koff, off int // these help so we don't retry the same dev multiple times
-			for k := int64(1); k < 7 && int(k)+koff < len(letters); k++ {
-				off, attachDevice = findNextDevNode(prefix, letters[int(k)+koff:len(letters)])
-				koff += off
-				if k > 3 {
-					// if we get high enough, we are probably racing with other jobs
-					// so introduce some randomness.
-					koff += rand.Intn(5)
+			// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+			letters := "fghijklmnopqrstuvwxyz"
+			// start at a random position
+			off := rand.Int63n(int64(len(letters)))
+			// retry up to 10 times
+			for k := int64(0); k < 10; k++ {
+				if off + k > int64(len(letters) - 1) {
+					off = rand.Int63n(int64(len(letters)))
 				}
+				off, attachDevice = findNextDevNode(prefix, off+k, letters)
 
 				if _, err := svc.AttachVolume(&ec2.AttachVolumeInput{
 					InstanceId: aws.String(iid.InstanceId),
@@ -364,48 +354,48 @@ func CreateAttach(cli *Args) ([]string, error) {
 					Device:     aws.String(attachDevice),
 				}); err != nil {
 					// race condition attaching devices from multiple containers to the same host /dev address.
-					// so retry 7 times (k) with randomish wait time.
+					// so retry with randomish wait time.
 					log.Printf("retrying EBS attach because of difficulty getting volume. error was: %+T. %s", err, err)
 					if strings.Contains(err.Error(), "is already in use") {
-						time.Sleep((time.Duration(3 * (k + rand.Int63n(2*k)))) * time.Second)
+						time.Sleep((time.Duration(1 * (k + rand.Int63n(2*k)))) * time.Second)
 						continue
 					}
-
-					return nil, errors.Wrap(err, "error attaching device")
+					return nil, nil, errors.Wrap(err, "error attaching device")
 				}
 
 				volumes = append(volumes, *rsp.VolumeId)
+				devices = append(devices, attachDevice)
 
 				if err := WaitForVolumeStatus(svc, rsp.VolumeId, "in-use"); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 
 				if !waitForDevice(attachDevice) {
-					return nil, err
+					return nil, nil, err
 				}
-				devices = append(devices, attachDevice)
+
 				attached = true
 				break
 			}
 		}
+
 		if !attached {
-			return nil, fmt.Errorf("ebsmount: unable to attach device")
+			return nil, nil, fmt.Errorf("ebsmount: unable to attach device")
 		}
 
 		if !cli.Keep {
 			if err := DeleteOnTermination(svc, iid.InstanceId, *rsp.VolumeId, attachDevice); err != nil {
-				return nil, errors.Wrap(err, "error setting delete on termination")
+				return nil, nil, errors.Wrap(err, "error setting delete on termination")
 			}
 		}
-
 	}
 
 	fmt.Println(strings.Join(volumes, " "))
 	if err = makeDir(cli.MountPoint); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return devices, nil
+	return devices, volumes, nil
 }
 
 func DeleteOnTermination(svc *ec2.EC2, instanceId string, volumeId string, attachDevice string) error {
@@ -476,13 +466,14 @@ func Main() {
 		FSType:     "ext4",
 		N:          1,
 	}
+
 	if p := arg.MustParse(cli); cli.VolumeType != "st1" && cli.VolumeType != "gp2" && cli.VolumeType != "sc1" && cli.VolumeType != "io1" && cli.VolumeType != "standard" {
 		p.Fail("volume type must be one of st1/gp2/sc1/io1")
 	} else if cli.N > 16 || cli.N < 1 {
 		p.Fail("number of volumes should be between 1 and 16")
 	}
 
-	devices, err := CreateAttach(cli)
+	devices, _, err := CreateAttach(cli)
 	if err != nil {
 		panic(err)
 	}
@@ -502,12 +493,12 @@ func Main() {
 	fmt.Fprintf(os.Stderr, "mounted %d EBS drives to %s\n", len(devices), cli.MountPoint)
 }
 
-func findNextDevNode(prefix string, suffixChars string) (int, string) {
-	for i, s := range suffixChars {
+func findNextDevNode(prefix string, off int64, chars string) (int64, string) {
+	for i, s := range chars[off:] {
 		if _, err := os.Stat(prefix + string(s)); err == nil {
 			continue
 		} else if os.IsNotExist(err) {
-			return i, prefix + string(s)
+			return off + int64(i), prefix + string(s)
 		}
 	}
 	panic(fmt.Errorf("no device found with prefix: %s", prefix))
@@ -520,7 +511,6 @@ func waitForDevice(device string) bool {
 		} else {
 			return true
 		}
-
 	}
 	return false
 }
