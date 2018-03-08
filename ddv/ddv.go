@@ -8,11 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/base2genomics/batchit/exsmount"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/base2genomics/batchit/util"
 )
 
 func DetachAndDelete(vid string) error {
@@ -65,7 +64,7 @@ func DetachAndDelete(vid string) error {
 	for i := 0; i < 10; i++ {
 		v, err = svc.DetachVolume(dtvi)
 		if err == nil {
-			if err := exsmount.WaitForVolumeStatus(svc, &vid, "available"); err != nil {
+			if err := util.WaitForVolumeStatus(svc, &vid, "available"); err != nil {
 				return err
 			}
 			break
