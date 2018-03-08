@@ -20,7 +20,11 @@ func DetachAndDelete(vid string) error {
 	var drsp *ec2.DescribeVolumesOutput
 	var err error
 
-	for _, region := range []string{"us-east-1", "us-east-2", "us-west-1", "us-west-2", "ap-south-1",
+	for _, region := range []string{"us-east-1",
+		"us-east-2",
+		"us-west-1",
+		"us-west-2",
+		"ap-south-1",
 		"ap-northeast-2",
 		"ap-northeast-1",
 		"ca-central-1",
@@ -49,7 +53,7 @@ func DetachAndDelete(vid string) error {
 		return err
 	}
 
-	log.Printf("ddv: found volume for deletion in region: %s", *svc.Config.Region)
+	log.Printf("ddv: found volume %s for deletion in region: %s", vid, *svc.Config.Region)
 
 	dtvi := &ec2.DetachVolumeInput{
 		VolumeId: aws.String(vid),

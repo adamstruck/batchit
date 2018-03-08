@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/base2genomics/batchit"
+	"github.com/base2genomics/batchit/ddv"
 	"github.com/pkg/errors"
 )
 
@@ -221,9 +222,9 @@ func Create(svc *ec2.EC2, iid *IID, size int64, typ string, iops int64, is ...in
 		Size:             aws.Int64(size), //GB
 		VolumeType:       aws.String(typ),
 		TagSpecifications: []*ec2.TagSpecification{
-			&ec2.TagSpecification{
+			{
 				ResourceType: aws.String("volume"),
-				Tags:         []*ec2.Tag{&ec2.Tag{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("batchit-%s%s", iid.InstanceId, suf))}},
+				Tags:         []*ec2.Tag{{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("batchit-%s%s", iid.InstanceId, suf))}},
 			},
 		},
 	}
@@ -322,7 +323,7 @@ func CreateAttach(cli *Args) ([]string, []string, error) {
 		defer func() {
 			if !attached {
 				log.Println("batchit: unsuccessful EBS volume attachment, deleting volume")
-				_, err := svc.DeleteVolume(&ec2.DeleteVolumeInput{VolumeId: rsp.VolumeId})
+				err := ddv.DetachAndDelete(*rsp.VolumeId)
 				if err != nil {
 					log.Println("batchit: error deleting volume:", err)
 				}
@@ -343,7 +344,7 @@ func CreateAttach(cli *Args) ([]string, []string, error) {
 			off := rand.Int63n(int64(len(letters)))
 			// retry up to 10 times
 			for k := int64(0); k < 10; k++ {
-				if off + k > int64(len(letters) - 1) {
+				if off+k > int64(len(letters)-1) {
 					off = rand.Int63n(int64(len(letters)))
 				}
 				off, attachDevice = findNextDevNode(prefix, off+k, letters)
@@ -406,7 +407,7 @@ func DeleteOnTermination(svc *ec2.EC2, instanceId string, volumeId string, attac
 	moi := &ec2.ModifyInstanceAttributeInput{
 		InstanceId: aws.String(instanceId),
 		BlockDeviceMappings: []*ec2.InstanceBlockDeviceMappingSpecification{
-			&ec2.InstanceBlockDeviceMappingSpecification{
+			{
 				// TODO: see if attachDevice is required
 				DeviceName: ad,
 				Ebs: &ec2.EbsInstanceBlockDeviceSpecification{
