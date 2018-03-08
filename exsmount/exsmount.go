@@ -308,7 +308,7 @@ func Attach(svc *ec2.EC2, iid *IID, volumeId string) (string, error) {
 
 		_, err := svc.AttachVolume(&ec2.AttachVolumeInput{
 			InstanceId: aws.String(iid.InstanceId),
-			VolumeId:   volumeId,
+			VolumeId:   aws.String(volumeId),
 			Device:     aws.String(attachDevice),
 		})
 		if err != nil {
@@ -322,7 +322,7 @@ func Attach(svc *ec2.EC2, iid *IID, volumeId string) (string, error) {
 			return "", fmt.Errorf("failed to attach device")
 		}
 
-		if err := util.WaitForVolumeStatus(svc, volumeId, "in-use"); err != nil {
+		if err := util.WaitForVolumeStatus(svc, aws.String(volumeId), "in-use"); err != nil {
 			return "", err
 		}
 
