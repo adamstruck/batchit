@@ -278,6 +278,69 @@ func EFSMount(efs string, mountPoint string, mountOpts string) error {
 	return cmd.Run()
 }
 
+func Attach(svc *ec2.EC2, iid *IID, volumeId string) (string, error) {
+	var attached bool
+
+	defer func() {
+		if !attached {
+			log.Println("batchit: unsuccessful EBS volume attachment, deleting volume")
+			err := ddv.DetachAndDelete(volumeId)
+			if err != nil {
+				log.Println("batchit: error deleting volume:", err)
+			}
+		}
+	}()
+
+	// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+	// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/volume_limits.html
+	// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+	prefix := "/dev/sd"
+	letters := "fghijklmnopqrstuvwxyz"
+	attachDevice := ""
+	// start at a random position
+	off := rand.Int63n(int64(len(letters)))
+	// retry up to 10 times
+	for k := int64(0); k < 10; k++ {
+		if off+k > int64(len(letters)-1) {
+			off = rand.Int63n(int64(len(letters)))
+		}
+		off, attachDevice = findNextDevNode(prefix, off+k, letters)
+
+		_, err := svc.AttachVolume(&ec2.AttachVolumeInput{
+			InstanceId: aws.String(iid.InstanceId),
+			VolumeId:   volumeId,
+			Device:     aws.String(attachDevice),
+		})
+		if err != nil {
+			// race condition attaching devices from multiple containers to the same host /dev address.
+			// so retry with randomish wait time.
+			log.Printf("retrying EBS attach because of difficulty getting volume. error was: %+T. %s", err, err)
+			if strings.Contains(err.Error(), "is already in use") {
+				time.Sleep((time.Duration(1 * (k + rand.Int63n(2*k)))) * time.Second)
+				continue
+			}
+			return "", fmt.Errorf("failed to attach device")
+		}
+
+		if err := util.WaitForVolumeStatus(svc, volumeId, "in-use"); err != nil {
+			return "", err
+		}
+
+		if !waitForDevice(attachDevice) {
+			return "", fmt.Errorf("error waiting for device to attach")
+		}
+
+		attached = true
+		break
+	}
+
+	if !attached {
+		return "", fmt.Errorf("failed to attach device")
+	}
+
+	return attachDevice, nil
+}
+
 func CreateAttach(cli *Args) ([]string, []string, error) {
 	var devices []string
 	var volumes []string
@@ -319,74 +382,16 @@ func CreateAttach(cli *Args) ([]string, []string, error) {
 			return nil, nil, errors.Wrap(err, "error creating volume")
 		}
 
-		attached := false
-
-		defer func() {
-			if !attached {
-				log.Println("batchit: unsuccessful EBS volume attachment, deleting volume")
-				err := ddv.DetachAndDelete(*rsp.VolumeId)
-				if err != nil {
-					log.Println("batchit: error deleting volume:", err)
-				}
-			}
-		}()
-
-		// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
-		// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/volume_limits.html
-		var attachDevice string
-		for _, prefix := range []string{"/dev/sd", "/dev/xvd"} {
-			if attached {
-				break
-			}
-
-			// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
-			letters := "fghijklmnopqrstuvwxyz"
-			// start at a random position
-			off := rand.Int63n(int64(len(letters)))
-			// retry up to 10 times
-			for k := int64(0); k < 10; k++ {
-				if off+k > int64(len(letters)-1) {
-					off = rand.Int63n(int64(len(letters)))
-				}
-				off, attachDevice = findNextDevNode(prefix, off+k, letters)
-
-				if _, err := svc.AttachVolume(&ec2.AttachVolumeInput{
-					InstanceId: aws.String(iid.InstanceId),
-					VolumeId:   rsp.VolumeId,
-					Device:     aws.String(attachDevice),
-				}); err != nil {
-					// race condition attaching devices from multiple containers to the same host /dev address.
-					// so retry with randomish wait time.
-					log.Printf("retrying EBS attach because of difficulty getting volume. error was: %+T. %s", err, err)
-					if strings.Contains(err.Error(), "is already in use") {
-						time.Sleep((time.Duration(1 * (k + rand.Int63n(2*k)))) * time.Second)
-						continue
-					}
-					return nil, nil, errors.Wrap(err, "error attaching device")
-				}
-
-				volumes = append(volumes, *rsp.VolumeId)
-				devices = append(devices, attachDevice)
-
-				if err := util.WaitForVolumeStatus(svc, rsp.VolumeId, "in-use"); err != nil {
-					return nil, nil, err
-				}
-
-				if !waitForDevice(attachDevice) {
-					return nil, nil, err
-				}
-
-				attached = true
-				break
-			}
+		device, err := Attach(svc, iid, *rsp.VolumeId)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "error attaching volume")
 		}
 
-		if !attached {
-			return nil, nil, fmt.Errorf("ebsmount: unable to attach device")
-		}
+		volumes = append(volumes, *rsp.VolumeId)
+		devices = append(devices, device)
 
 		if !cli.Keep {
-			if err := DeleteOnTermination(svc, iid.InstanceId, *rsp.VolumeId, attachDevice); err != nil {
+			if err := DeleteOnTermination(svc, iid.InstanceId, *rsp.VolumeId, device); err != nil {
 				return nil, nil, errors.Wrap(err, "error setting delete on termination")
 			}
 		}
